@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+
+data/cache/
+data/state/
+reports/*.xlsx
+reports/*.csv
+reports/*.md

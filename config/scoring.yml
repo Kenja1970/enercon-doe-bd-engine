@@ -1,0 +1,21 @@
+weights:
+  doe_market_fit: 25
+  engineering_fit: 25
+  strategic_site_fit: 15
+  timing_fit: 10
+  bad_fit_penalty: -25
+  missing_due_date_penalty: -5
+
+strategic_sites:
+  - Oak Ridge
+  - ORNL
+  - Y-12
+  - Savannah River
+  - Hanford
+  - INL
+  - Idaho National Laboratory
+  - Los Alamos
+  - LANL
+  - Pantex
+  - Sandia
+  - WIPP

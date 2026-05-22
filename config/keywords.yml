@@ -1,0 +1,58 @@
+must_have_market_terms:
+  - DOE
+  - Department of Energy
+  - NNSA
+  - National Nuclear Security Administration
+  - Oak Ridge
+  - ORNL
+  - Y-12
+  - Savannah River
+  - Hanford
+  - Idaho National Laboratory
+  - INL
+  - Los Alamos
+  - LANL
+  - Sandia
+  - Pantex
+  - WIPP
+  - nuclear
+  - environmental management
+  - energy
+
+capability_terms:
+  - engineering services
+  - architect engineer
+  - architect-engineer
+  - A-E
+  - design
+  - design-build
+  - nuclear
+  - licensing
+  - safety basis
+  - fire protection
+  - mechanical
+  - electrical
+  - instrumentation
+  - controls
+  - I&C
+  - civil
+  - structural
+  - environmental
+  - commissioning
+  - facility modernization
+  - power
+  - grid
+  - infrastructure
+  - construction management
+
+bad_fit_terms:
+  - janitorial
+  - cafeteria
+  - grounds maintenance
+  - office supplies
+  - furniture
+  - security guard
+  - staffing only
+  - custodial
+  - landscaping
+  - food service

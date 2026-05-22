@@ -1,0 +1,8 @@
+.venv
+__pycache__
+*.pyc
+.env
+data/cache
+reports/*.xlsx
+reports/*.csv
+reports/*.md
