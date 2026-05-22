@@ -28,13 +28,17 @@ def run_command(command: list[str]) -> tuple[int, str]:
         shell=False,
     )
 
+    output = ""
+
     if result.stdout:
         print(result.stdout)
+        output += result.stdout
 
     if result.stderr:
         print(result.stderr)
+        output += "\n" + result.stderr
 
-    return result.returncode, result.stdout + "\n" + result.stderr
+    return result.returncode, output
 
 
 def read_csv_safe(path: Path) -> pd.DataFrame:
@@ -47,7 +51,7 @@ def read_csv_safe(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def make_status(fetch_output: str) -> None:
+def make_status(combined_output: str, overall_success: bool) -> None:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
     run_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -58,9 +62,9 @@ def make_status(fetch_output: str) -> None:
     run_log = read_csv_safe(RUN_LOG_CSV)
 
     quota_reached = (
-        "quota" in fetch_output.lower()
-        or "throttle" in fetch_output.lower()
-        or "429" in fetch_output.lower()
+        "quota" in combined_output.lower()
+        or "throttle" in combined_output.lower()
+        or "429" in combined_output.lower()
     )
 
     latest_log = {}
@@ -76,14 +80,19 @@ def make_status(fetch_output: str) -> None:
     lines.append(f"Run completed: {run_date}")
     lines.append("")
 
-    if quota_reached:
-        lines.append("## Status: SAM.gov quota/throttle reached")
-        lines.append("")
-        lines.append("The engine stopped because SAM.gov quota or throttling was encountered. Partial results were preserved and processed.")
+    if overall_success:
+        if quota_reached:
+            lines.append("## Status: Completed with SAM.gov quota/throttle stop")
+            lines.append("")
+            lines.append("The engine stopped because SAM.gov quota or throttling was encountered. Partial results were preserved and processed.")
+        else:
+            lines.append("## Status: Completed successfully")
+            lines.append("")
+            lines.append("The engine completed the configured daily search run without hitting quota/throttle.")
     else:
-        lines.append("## Status: Run completed without quota stop")
+        lines.append("## Status: Failed")
         lines.append("")
-        lines.append("The engine completed the available search stack or used cached results without hitting the quota limit.")
+        lines.append("The engine encountered an error. Review the execution output below.")
 
     lines.append("")
     lines.append("## Results")
@@ -95,47 +104,62 @@ def make_status(fetch_output: str) -> None:
     lines.append(f"- Searches run: {latest_log.get('searches', 'Unknown')}")
     lines.append("")
 
-    if new_count == 0:
-        lines.append("## Notice")
-        lines.append("")
-        lines.append("No new unique active A/E opportunities were found in this run.")
-        lines.append("")
-    else:
-        lines.append("## New Opportunities Found")
-        lines.append("")
-        preview_cols = [
-            "title",
-            "department",
-            "office",
-            "response_deadline",
-            "naics_code",
-            "ui_link",
-        ]
-        available_cols = [c for c in preview_cols if c in new_today.columns]
-
-        for i, (_, row) in enumerate(new_today.head(10).iterrows(), start=1):
-            lines.append(f"### {i}. {row.get('title', '')}")
-            lines.append(f"- Department: {row.get('department', '')}")
-            lines.append(f"- Office: {row.get('office', '')}")
-            lines.append(f"- Deadline: {row.get('response_deadline', '')}")
-            lines.append(f"- NAICS: {row.get('naics_code', '')}")
-            lines.append(f"- Link: {row.get('ui_link', '')}")
-            lines.append("")
-
-    if not ranked.empty and "recommendation" in ranked.columns:
-        lines.append("## Scored Pipeline Snapshot")
+    if not ranked.empty and "review_priority" in ranked.columns:
+        lines.append("## Actionable Pipeline Snapshot")
         lines.append("")
         for label in [
-            "Pursue / Discuss Monday",
-            "Strong Monitor / Validate Owner",
-            "Monitor / Shape",
-            "Low Priority",
-            "No-Go",
+            "1 - Review Today",
+            "2 - Validate Owner",
+            "3 - Monitor",
+            "4 - Low Priority",
+            "5 - Drop",
         ]:
-            count = (ranked["recommendation"] == label).sum()
+            count = (ranked["review_priority"] == label).sum()
             lines.append(f"- {label}: {count}")
-
         lines.append("")
+
+    if not ranked.empty and "review_priority" in ranked.columns:
+        actionable = ranked[
+            ranked["review_priority"].isin(
+                ["1 - Review Today", "2 - Validate Owner", "3 - Monitor"]
+            )
+        ].head(10)
+
+        if actionable.empty:
+            lines.append("## Notice")
+            lines.append("")
+            lines.append("No new actionable A/E opportunities were identified in this run.")
+            lines.append("")
+        else:
+            lines.append("## Top Actionable Opportunities")
+            lines.append("")
+            for i, (_, row) in enumerate(actionable.iterrows(), start=1):
+                lines.append(f"### {i}. {row.get('title', '')}")
+                lines.append(f"- Priority: {row.get('review_priority', '')}")
+                lines.append(f"- Action: {row.get('action_today', '')}")
+                lines.append(f"- Score: {row.get('go_no_go_score', '')}")
+                lines.append(f"- Market: {row.get('customer_market', '')}")
+                lines.append(f"- Deadline: {row.get('response_deadline', '')}")
+                lines.append(f"- NAICS: {row.get('clean_naics', '')}")
+                lines.append(f"- Link: {row.get('ui_link', '')}")
+                lines.append("")
+    else:
+        if new_count == 0:
+            lines.append("## Notice")
+            lines.append("")
+            lines.append("No new unique active opportunities were found in this run.")
+            lines.append("")
+        else:
+            lines.append("## New Opportunities Found")
+            lines.append("")
+            for i, (_, row) in enumerate(new_today.head(10).iterrows(), start=1):
+                lines.append(f"### {i}. {row.get('title', '')}")
+                lines.append(f"- Department: {row.get('department', '')}")
+                lines.append(f"- Office: {row.get('office', '')}")
+                lines.append(f"- Deadline: {row.get('response_deadline', '')}")
+                lines.append(f"- NAICS: {row.get('naics_code', '')}")
+                lines.append(f"- Link: {row.get('ui_link', '')}")
+                lines.append("")
 
     lines.append("## Output Files")
     lines.append("")
@@ -146,61 +170,64 @@ def make_status(fetch_output: str) -> None:
     lines.append(f"- Summary: `{MONDAY_SUMMARY}`")
     lines.append("")
 
+    lines.append("## Execution Output")
+    lines.append("")
+    lines.append("```text")
+    lines.append(combined_output[-6000:])
+    lines.append("```")
+
     STATUS_MD.write_text("\n".join(lines), encoding="utf-8")
 
     print(f"Daily status written to: {STATUS_MD.resolve()}")
 
-    if new_count == 0:
-        print("NOTICE: No new unique active A/E opportunities were found.")
+    if overall_success:
+        print("NOTICE: Daily opportunity engine completed.")
     else:
-        print(f"NOTICE: {new_count} new unique active opportunities found.")
-
-    if quota_reached:
-        print("NOTICE: SAM.gov quota/throttle was reached. Partial results were preserved.")
+        print("NOTICE: Daily opportunity engine failed. See status report.")
 
 
 def main() -> None:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-    # High max-calls intentionally allows fetch_sam.py to continue until
-    # SAM.gov quota/throttle is reached or the search stack is exhausted.
+    # Cloud-safe path separators.
+    # Start with 5 calls/day. Increase later only after the output is trusted.
     fetch_command = [
         "uv",
         "run",
         "python",
-        "src\\fetch_sam.py",
+        "src/fetch_sam.py",
         "--max-calls",
-        "999",
+        "5",
         "--days-back",
         "45",
         "--limit",
         "50",
     ]
 
-    fetch_code, fetch_output = run_command(fetch_command)
-
-    # Even if fetch hits quota, continue processing whatever data was saved.
-    if fetch_code != 0:
-        print("Fetch command returned a non-zero exit code. Continuing to process saved data.")
-
     commands = [
-        ["uv", "run", "python", "src\\score_sam.py"],
-        ["uv", "run", "python", "src\\merge_review.py"],
-        ["uv", "run", "python", "src\\make_monday_summary.py"],
+        fetch_command,
+        ["uv", "run", "python", "src/score_sam.py"],
+        ["uv", "run", "python", "src/merge_review.py"],
+        ["uv", "run", "python", "src/make_monday_summary.py"],
     ]
 
-    combined_output = fetch_output
+    combined_output = ""
+    overall_success = True
 
     for command in commands:
         code, output = run_command(command)
         combined_output += "\n" + output
 
         if code != 0:
+            overall_success = False
             print(f"Command failed: {' '.join(command)}")
-            make_status(combined_output)
-            sys.exit(code)
+            break
 
-    make_status(combined_output)
+    make_status(combined_output, overall_success)
+
+    if not overall_success:
+        sys.exit(1)
 
     print("\nDaily opportunity engine run complete.")
     print(f"Status report: {STATUS_MD.resolve()}")
