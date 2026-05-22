@@ -1,866 +1,426 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import requests
+from dotenv import load_dotenv
 
+load_dotenv()
 
-# ============================================================
-# SAM.gov Go/No-Go Scoring
-# Target: DOE / NNSA / Federal A/E + Engineering Services
-# ============================================================
+BASE_URL = "https://api.sam.gov/opportunities/v2/search"
 
 RAW_DIR = Path("data/raw")
+CACHE_DIR = Path("data/cache")
+STATE_DIR = Path("data/state")
 REPORTS_DIR = Path("reports")
-REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-INPUT_CSV = RAW_DIR / "sam_active_master.csv"
-OUTPUT_CSV = REPORTS_DIR / "sam_go_no_go_ranked.csv"
-OUTPUT_XLSX = REPORTS_DIR / "sam_go_no_go_ranked.xlsx"
-TOP_20_CSV = REPORTS_DIR / "sam_top_20_review.csv"
+MASTER_CSV = RAW_DIR / "sam_active_master.csv"
+NEW_TODAY_CSV = RAW_DIR / "sam_new_unique_today.csv"
+DEBUG_CSV = RAW_DIR / "sam_debug_this_run.csv"
+RAW_JSON = RAW_DIR / "sam_raw_latest.json"
+RUN_LOG_CSV = RAW_DIR / "sam_run_log.csv"
+STATE_JSON = STATE_DIR / "sam_query_state.json"
 
+for directory in [RAW_DIR, CACHE_DIR, STATE_DIR, REPORTS_DIR]:
+    directory.mkdir(parents=True, exist_ok=True)
 
-# ------------------------------------------------------------
-# Target NAICS codes
-# ------------------------------------------------------------
-
-TARGET_NAICS = {
-    "541330": "Engineering Services",
-    "541310": "Architectural Services",
-    "541620": "Environmental Consulting Services",
-    "541690": "Other Scientific and Technical Consulting Services",
-    "541350": "Building Inspection Services",
-    "541340": "Drafting Services",
-}
-
-# Keep this tight.
-# 236220 and 237990 were intentionally removed because they were allowing
-# construction-only work into the Top 20 review list.
-SECONDARY_NAICS = {
-    "541715": "R&D in Nanotechnology / Engineering / Life Sciences",
-}
-
-BAD_NAICS_PREFIXES = {
-    "31",  # Manufacturing
-    "32",  # Manufacturing
-    "33",  # Manufacturing
-    "42",  # Wholesale trade
-    "44",  # Retail
-    "45",  # Retail
-}
-
-
-# ------------------------------------------------------------
-# High-value positive fit terms
-# ------------------------------------------------------------
-
-AE_ENGINEERING_TERMS = [
-    "architect engineer",
-    "architect-engineer",
-    "a-e",
-    "ae services",
-    "a/e",
-    "engineering services",
-    "professional engineering",
-    "design services",
-    "design engineering",
-    "engineering design",
-    "facility design",
-    "title i",
-    "title ii",
-    "title iii",
-    "construction phase services",
-    "construction support",
-    "construction management",
-    "cm services",
-    "design-bid-build",
-    "design build",
-    "design-build",
-    "idiq",
-    "task order",
-    "site investigation",
-    "field investigation",
-    "engineering assessment",
-    "condition assessment",
-    "facility assessment",
-    "feasibility study",
-    "technical study",
-    "code analysis",
-    "cost estimate",
-    "independent technical review",
-    "quality assurance",
-    "quality control",
+# SAM.gov official params used here:
+# - postedFrom / postedTo are mandatory with date format MM/dd/yyyy
+# - ptype is procurement type: r = Sources Sought, o = Solicitation, p = Presolicitation, k = Combined Synopsis/Solicitation
+# - ncode is NAICS code, not naicsCode
+# - title is title search
+# - organizationName filters by department/subtier/office name and supports general search
+SEARCH_PLAN = [
+    {"name": "DOE Engineering Sources Sought", "organizationName": "Department of Energy", "ncode": "541330", "ptype": "r"},
+    {"name": "DOE Engineering Solicitations", "organizationName": "Department of Energy", "ncode": "541330", "ptype": "o"},
+    {"name": "DOE A-E Sources Sought", "title": "architect engineer", "ncode": "541330", "ptype": "r"},
+    {"name": "DOE A-E Solicitations", "title": "architect engineer", "ncode": "541330", "ptype": "o"},
+    {"name": "NNSA Engineering Sources Sought", "organizationName": "National Nuclear Security Administration", "ncode": "541330", "ptype": "r"},
+    {"name": "NNSA Engineering Solicitations", "organizationName": "National Nuclear Security Administration", "ncode": "541330", "ptype": "o"},
+    {"name": "DOE Architectural Sources Sought", "organizationName": "Department of Energy", "ncode": "541310", "ptype": "r"},
+    {"name": "DOE Architectural Solicitations", "organizationName": "Department of Energy", "ncode": "541310", "ptype": "o"},
+    {"name": "DOE Environmental Consulting Sources Sought", "organizationName": "Department of Energy", "ncode": "541620", "ptype": "r"},
+    {"name": "DOE Environmental Consulting Solicitations", "organizationName": "Department of Energy", "ncode": "541620", "ptype": "o"},
+    {"name": "DOE Technical Consulting Sources Sought", "organizationName": "Department of Energy", "ncode": "541690", "ptype": "r"},
+    {"name": "DOE Technical Consulting Solicitations", "organizationName": "Department of Energy", "ncode": "541690", "ptype": "o"},
+    {"name": "Oak Ridge Engineering", "organizationName": "Oak Ridge", "ncode": "541330", "ptype": "r"},
+    {"name": "Y-12 Engineering", "organizationName": "Y-12", "ncode": "541330", "ptype": "r"},
+    {"name": "Savannah River Engineering", "organizationName": "Savannah River", "ncode": "541330", "ptype": "r"},
+    {"name": "Hanford Engineering", "organizationName": "Hanford", "ncode": "541330", "ptype": "r"},
+    {"name": "INL Engineering", "organizationName": "Idaho National Laboratory", "ncode": "541330", "ptype": "r"},
+    {"name": "Los Alamos Engineering", "organizationName": "Los Alamos", "ncode": "541330", "ptype": "r"},
+    {"name": "Sandia Engineering", "organizationName": "Sandia", "ncode": "541330", "ptype": "r"},
+    {"name": "Pantex Engineering", "organizationName": "Pantex", "ncode": "541330", "ptype": "r"},
+    {"name": "Fire Protection Engineering", "title": "fire protection engineering", "ncode": "541330", "ptype": "r"},
+    {"name": "Facility Modernization Engineering", "title": "facility modernization engineering", "ncode": "541330", "ptype": "r"},
+    {"name": "Mechanical Engineering", "title": "mechanical engineering", "ncode": "541330", "ptype": "r"},
+    {"name": "Electrical Engineering", "title": "electrical engineering", "ncode": "541330", "ptype": "r"},
+    {"name": "Civil Structural Engineering", "title": "civil structural engineering", "ncode": "541330", "ptype": "r"},
 ]
 
-DOE_SITE_TERMS = [
-    "department of energy",
-    "doe",
-    "energy, department of",
-    "nnsa",
-    "national nuclear security administration",
-    "oak ridge",
-    "ornl",
-    "y-12",
-    "y12",
-    "savannah river",
-    "srs",
-    "hanford",
-    "idaho national laboratory",
-    "inl",
-    "los alamos",
-    "lanl",
-    "sandia",
-    "pantex",
-    "wipp",
-    "nevada national security site",
-    "nnss",
-    "kansas city national security campus",
-    "kcnsc",
-]
-
-DISCIPLINE_TERMS = [
-    "mechanical",
-    "electrical",
-    "civil",
-    "structural",
-    "architectural",
-    "fire protection",
-    "plumbing",
-    "hvac",
-    "instrumentation",
-    "controls",
-    "i&c",
-    "environmental",
-    "geotechnical",
-    "survey",
-    "commissioning",
-    "energy",
-    "power",
-    "nuclear",
-    "regulatory",
-    "licensing",
-    "safety basis",
-    "industrial",
-    "infrastructure",
-    "facility modernization",
-    "renovation",
-    "remediation",
-    "nepa",
-    "permitting",
-]
-
-EARLY_CAPTURE_TERMS = [
-    "sources sought",
-    "request for information",
-    "rfi",
-    "market research",
-    "capability statement",
-    "industry day",
-    "presolicitation",
-    "draft request for proposal",
-    "draft rfp",
-]
-
-SMALL_BUSINESS_TERMS = [
-    "small business",
-    "small business set-aside",
-    "sdvosb",
-    "service-disabled veteran",
-    "8(a)",
-    "8a",
-    "hubzone",
-    "woman owned",
-    "wosb",
-    "edwosb",
+COLUMNS = [
+    "notice_id", "title", "solicitation_number", "posted_date", "response_deadline",
+    "active", "notice_type", "base_type", "archive_type", "archive_date", "set_aside",
+    "set_aside_code", "naics_code", "classification_code", "department", "sub_tier",
+    "office", "full_parent_path_name", "organization_type", "description", "ui_link",
+    "resource_links", "point_of_contact", "place_of_performance", "office_address",
+    "search_name", "search_title", "search_organization", "search_naics", "search_ptype",
+    "first_seen", "last_seen", "query_hits",
 ]
 
 
-# ------------------------------------------------------------
-# Bad-fit / commodity / goods terms
-# ------------------------------------------------------------
-
-BAD_FIT_TERMS = [
-    "equipment",
-    "supplies",
-    "supply",
-    "parts",
-    "replacement parts",
-    "spare parts",
-    "repair parts",
-    "kit",
-    "kits",
-    "hardware",
-    "software license",
-    "software subscription",
-    "subscription",
-    "furniture",
-    "chairs",
-    "desk",
-    "desks",
-    "vehicles",
-    "vehicle",
-    "truck",
-    "forklift",
-    "trailer",
-    "generator",
-    "pump",
-    "valve",
-    "valves",
-    "pipe fittings",
-    "filters",
-    "laboratory supplies",
-    "lab supplies",
-    "chemical",
-    "chemicals",
-    "reagent",
-    "reagents",
-    "protective clothing",
-    "ppe",
-    "gloves",
-    "janitorial",
-    "custodial",
-    "grounds maintenance",
-    "landscaping",
-    "cafeteria",
-    "food service",
-    "security guard",
-    "armed guard",
-    "medical staffing",
-    "temporary staffing",
-    "staff augmentation",
-    "it help desk",
-    "help desk",
-    "printer",
-    "toner",
-    "computers",
-    "laptops",
-    "servers",
-    "network switch",
-    "radios",
-    "uniforms",
-    "crane rental",
-    "rental equipment",
-    "waste containers",
-    "dumpsters",
-]
-
-CONSTRUCTION_ONLY_TERMS = [
-    "construction only",
-    "general construction",
-    "roof replacement",
-    "paving",
-    "asphalt",
-    "concrete repair",
-    "demolition",
-    "install only",
-    "installation only",
-    "replace",
-    "replacement",
-    "repair",
-    "construction project",
-    "contractor shall construct",
-    "contractor shall install",
-]
+def now_iso() -> str:
+    return datetime.now().replace(microsecond=0).isoformat()
 
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
+def today_mmddyyyy() -> str:
+    return datetime.now().strftime("%m/%d/%Y")
 
-def safe_text(value: Any) -> str:
-    if value is None or pd.isna(value):
+
+def days_back_mmddyyyy(days_back: int) -> str:
+    return (datetime.now() - timedelta(days=days_back)).strftime("%m/%d/%Y")
+
+
+def safe_str(value: Any) -> str:
+    if value is None:
         return ""
-    return str(value).lower()
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    return str(value)
 
 
-def hit_terms(text: str, terms: list[str]) -> list[str]:
-    return [term for term in terms if term.lower() in text]
+def clean_nan(value: Any) -> str:
+    text = safe_str(value)
+    return "" if text.lower() == "nan" else text
 
 
-def clean_naics(value: Any) -> str:
-    text = safe_text(value)
-    digits = "".join(ch for ch in text if ch.isdigit())
-    return digits[:6]
+def cache_key(params: dict[str, Any]) -> str:
+    safe_params = {k: v for k, v in params.items() if k != "api_key"}
+    raw = json.dumps(safe_params, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
-def parse_date(value: Any) -> pd.Timestamp | None:
-    if value is None or pd.isna(value) or str(value).strip() == "":
-        return None
+def load_state() -> dict[str, Any]:
+    if STATE_JSON.exists():
+        try:
+            return json.loads(STATE_JSON.read_text(encoding="utf-8"))
+        except Exception:
+            return {"completed_searches": []}
+    return {"completed_searches": []}
 
-    parsed = pd.to_datetime(value, errors="coerce", utc=False)
 
-    if pd.isna(parsed):
-        return None
+def save_state(state: dict[str, Any]) -> None:
+    STATE_JSON.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
-    return parsed
 
-
-def calculate_days_until_deadline(value: Any) -> int | None:
-    deadline = parse_date(value)
-
-    if deadline is None:
-        return None
-
-    # SAM.gov dates may be timezone-aware. Convert everything to timezone-naive.
-    if getattr(deadline, "tzinfo", None) is not None:
-        deadline = deadline.tz_localize(None)
-
-    today = pd.Timestamp.today().normalize()
-
-    if getattr(today, "tzinfo", None) is not None:
-        today = today.tz_localize(None)
-
-    return int((deadline.normalize() - today).days)
-
-
-def classify_recommendation(score: int) -> str:
-    if score >= 80:
-        return "Pursue / Discuss Monday"
-    if score >= 65:
-        return "Strong Monitor / Validate Owner"
-    if score >= 50:
-        return "Monitor / Shape"
-    if score >= 35:
-        return "Low Priority"
-    return "No-Go"
-
-
-def classify_customer_market(row: pd.Series) -> str:
-    text = " ".join(
-        [
-            safe_text(row.get("full_parent_path_name")),
-            safe_text(row.get("department")),
-            safe_text(row.get("sub_tier")),
-            safe_text(row.get("office")),
-            safe_text(row.get("title")),
-            safe_text(row.get("description")),
-        ]
-    )
-
-    if (
-        "energy, department of" in text
-        or "department of energy" in text
-        or "nnsa" in text
-        or "national nuclear security administration" in text
-    ):
-        return "DOE / NNSA"
-
-    if "us army corps of engineers" in text or "u.s. army corps of engineers" in text or "usace" in text:
-        return "USACE / Federal Infrastructure"
-
-    if (
-        "dept of defense" in text
-        or "department of defense" in text
-        or "department of the navy" in text
-        or "department of the air force" in text
-        or "department of the army" in text
-    ):
-        return "DoD / Defense Infrastructure"
-
-    if "veterans affairs" in text or "department of veterans affairs" in text:
-        return "VA / Healthcare Facilities"
-
-    if "general services administration" in text or "public buildings service" in text:
-        return "GSA / Federal Buildings"
-
-    if "architect of the capitol" in text:
-        return "Federal Buildings / Capitol"
-
-    if "department of homeland security" in text or "dhs" in text:
-        return "DHS / Federal Facilities"
-
-    return "Other Federal"
-
-
-def classify_pursuit_type(row: pd.Series, evidence_text: str) -> str:
-    notice_type = safe_text(row.get("notice_type"))
-    base_type = safe_text(row.get("base_type"))
-    ptype = safe_text(row.get("search_ptype"))
-
-    if ptype == "r" or "sources sought" in evidence_text or "request for information" in evidence_text:
-        return "Early Capture / Sources Sought"
-
-    if ptype == "p" or "presolicitation" in evidence_text or "pre-solicitation" in evidence_text:
-        return "Pre-Solicitation Watch"
-
-    if ptype == "o" or "solicitation" in notice_type or "solicitation" in base_type:
-        return "Active Solicitation"
-
-    if ptype == "k" or "combined synopsis" in evidence_text:
-        return "Combined Synopsis / Short-Fuse"
-
-    return "Unclassified"
-
-
-def assign_drop_reason(
-    naics: str,
-    bad_hits: list[str],
-    construction_hits: list[str],
-    ae_hits: list[str],
-    eligible_for_action: bool,
-) -> str:
-    if bad_hits:
-        return f"Likely goods/supplies/equipment: {', '.join(bad_hits[:5])}"
-
-    if construction_hits and not ae_hits:
-        return f"Likely construction-only without design language: {', '.join(construction_hits[:5])}"
-
-    if naics and naics not in TARGET_NAICS and naics not in SECONDARY_NAICS:
-        return f"Suppressed non-target NAICS: {naics}"
-
-    if naics in SECONDARY_NAICS and not ae_hits:
-        return f"Adjacent NAICS {naics} but no strong A/E language"
-
-    if not ae_hits:
-        return "No strong A/E or engineering-services language"
-
-    if not eligible_for_action:
-        return "Suppressed from action review"
-
-    return ""
-
-
-def assign_action_today(
-    score: int,
-    customer_market: str,
-    pursuit_type: str,
-    days_until_deadline: int | None,
-    risk_flags: str,
-) -> str:
-    risk_text = safe_text(risk_flags)
-
-    if "suppressed" in risk_text:
-        return "No action - suppressed"
-
-    if "expired" in risk_text or (days_until_deadline is not None and days_until_deadline < 0):
-        return "Drop - expired"
-
-    if "goods" in risk_text or "supply" in risk_text:
-        return "Drop unless manually confirmed"
-
-    if "construction-only" in risk_text:
-        return "No action - construction only"
-
-    if score >= 80 and pursuit_type == "Early Capture / Sources Sought":
-        return "Review today - possible shaping opportunity"
-
-    if score >= 80 and pursuit_type == "Active Solicitation":
-        return "Review today - confirm owner and deadline"
-
-    if score >= 65 and customer_market in {
-        "DOE / NNSA",
-        "USACE / Federal Infrastructure",
-        "GSA / Federal Buildings",
-        "Federal Buildings / Capitol",
-    }:
-        return "Validate customer owner"
-
-    if score >= 50:
-        return "Monitor only"
-
-    return "No action"
-
-
-def assign_review_priority(score: int, action_today: str) -> str:
-    if "Review today" in action_today:
-        return "1 - Review Today"
-    if "Validate customer owner" in action_today:
-        return "2 - Validate Owner"
-    if "Monitor only" in action_today or score >= 50:
-        return "3 - Monitor"
-    if score >= 35:
-        return "4 - Low Priority"
-    return "5 - Drop"
-
-
-# ------------------------------------------------------------
-# Scoring
-# ------------------------------------------------------------
-
-def score_row(row: pd.Series) -> pd.Series:
-    title = safe_text(row.get("title"))
-    description = safe_text(row.get("description"))
-    department = safe_text(row.get("department"))
-    sub_tier = safe_text(row.get("sub_tier"))
-    office = safe_text(row.get("office"))
-    parent = safe_text(row.get("full_parent_path_name"))
-    classification_code = safe_text(row.get("classification_code"))
-
-    # IMPORTANT:
-    # Do not use search_name, search_keyword, or query_hits to score.
-    # They are search trace fields only and can falsely inflate DOE/A-E fit.
-    evidence_text = " ".join(
-        [
-            title,
-            description,
-            department,
-            sub_tier,
-            office,
-            parent,
-            classification_code,
-        ]
-    )
-
-    score = 0
-    reasons = []
-    risk_flags = []
-
-    naics = clean_naics(row.get("naics_code"))
-    days_until_deadline = calculate_days_until_deadline(row.get("response_deadline"))
-    customer_market = classify_customer_market(row)
-    pursuit_type = classify_pursuit_type(row, evidence_text)
-
-    ae_hits = hit_terms(evidence_text, AE_ENGINEERING_TERMS)
-    site_hits = hit_terms(evidence_text, DOE_SITE_TERMS)
-    discipline_hits = hit_terms(evidence_text, DISCIPLINE_TERMS)
-    early_hits = hit_terms(evidence_text, EARLY_CAPTURE_TERMS)
-    sb_hits = hit_terms(evidence_text, SMALL_BUSINESS_TERMS)
-    bad_hits = hit_terms(evidence_text, BAD_FIT_TERMS)
-    construction_hits = hit_terms(evidence_text, CONSTRUCTION_ONLY_TERMS)
-
-    # --------------------------------------------------------
-    # NAICS fit
-    # --------------------------------------------------------
-
-    if naics in TARGET_NAICS:
-        score += 35
-        reasons.append(f"Target professional services NAICS {naics}: {TARGET_NAICS[naics]}")
-    elif naics in SECONDARY_NAICS:
-        score += 10
-        reasons.append(f"Secondary/adjacent NAICS {naics}: {SECONDARY_NAICS[naics]}")
-        risk_flags.append("Adjacent NAICS; verify engineering scope")
-    elif any(naics.startswith(prefix) for prefix in BAD_NAICS_PREFIXES):
-        score -= 35
-        reasons.append(f"Likely goods/manufacturing/retail NAICS: {naics}")
-        risk_flags.append("Likely goods/supply opportunity")
-    elif naics:
-        score -= 25
-        reasons.append(f"Non-target NAICS: {naics}")
-        risk_flags.append("NAICS does not clearly match A/E services")
+def get_next_searches(reset_stack: bool = False) -> list[dict[str, str]]:
+    if reset_stack:
+        state = {"completed_searches": []}
+        save_state(state)
     else:
-        score -= 10
-        reasons.append("Missing NAICS")
-        risk_flags.append("Missing NAICS")
+        state = load_state()
 
-    # --------------------------------------------------------
-    # A/E and engineering language
-    # --------------------------------------------------------
+    completed = set(state.get("completed_searches", []))
+    remaining = [s for s in SEARCH_PLAN if s["name"] not in completed]
 
-    if ae_hits:
-        add = min(30, len(ae_hits) * 8)
-        score += add
-        reasons.append(f"A/E-engineering language: {', '.join(ae_hits[:5])}")
-    else:
-        score -= 20
-        reasons.append("No strong A/E-engineering language detected")
-        risk_flags.append("Scope may not be A/E or engineering services")
+    if not remaining:
+        state = {"completed_searches": []}
+        save_state(state)
+        return SEARCH_PLAN.copy()
 
-    # --------------------------------------------------------
-    # DOE / NNSA / site relevance
-    # --------------------------------------------------------
-
-    if customer_market == "DOE / NNSA":
-        score += 18
-        reasons.append("Customer market classified as DOE / NNSA")
-    elif site_hits:
-        add = min(14, len(site_hits) * 4)
-        score += add
-        reasons.append(f"DOE/NNSA/site relevance: {', '.join(site_hits[:5])}")
-    elif customer_market in {"USACE / Federal Infrastructure", "GSA / Federal Buildings", "Federal Buildings / Capitol"}:
-        score += 6
-        reasons.append(f"Adjacent federal A/E market: {customer_market}")
-    else:
-        score -= 5
-        reasons.append(f"Non-DOE market classification: {customer_market}")
-
-    # --------------------------------------------------------
-    # Discipline fit
-    # --------------------------------------------------------
-
-    if discipline_hits:
-        add = min(20, len(discipline_hits) * 4)
-        score += add
-        reasons.append(f"Discipline/capability fit: {', '.join(discipline_hits[:6])}")
-
-    # --------------------------------------------------------
-    # Early capture value
-    # --------------------------------------------------------
-
-    if early_hits:
-        score += 10
-        reasons.append(f"Early capture indicator: {', '.join(early_hits[:3])}")
-
-    if pursuit_type == "Early Capture / Sources Sought":
-        score += 8
-        reasons.append("Sources sought/RFI is useful for shaping")
-    elif pursuit_type == "Active Solicitation":
-        score += 5
-        reasons.append("Active solicitation")
-    elif pursuit_type == "Combined Synopsis / Short-Fuse":
-        score -= 5
-        risk_flags.append("Likely short-fuse combined synopsis")
-
-    # --------------------------------------------------------
-    # Small business / teaming relevance
-    # --------------------------------------------------------
-
-    if sb_hits:
-        score += 4
-        reasons.append(f"Small business/team potential: {', '.join(sb_hits[:3])}")
-        risk_flags.append("Check set-aside status / prime eligibility")
-
-    # --------------------------------------------------------
-    # Bad fit terms
-    # --------------------------------------------------------
-
-    if bad_hits:
-        penalty = min(70, len(bad_hits) * 15)
-        score -= penalty
-        reasons.append(f"Bad-fit goods/supply terms: {', '.join(bad_hits[:6])}")
-        risk_flags.append("Contains goods/supplies/equipment language")
-
-    if construction_hits:
-        construction_penalty = min(35, len(construction_hits) * 10)
-        score -= construction_penalty
-        reasons.append(f"Construction-only risk terms: {', '.join(construction_hits[:5])}")
-        risk_flags.append("May be construction-only rather than A/E services")
-
-    # --------------------------------------------------------
-    # Deadline logic
-    # --------------------------------------------------------
-
-    if days_until_deadline is None:
-        score -= 5
-        reasons.append("Missing or unreadable response deadline")
-        risk_flags.append("Deadline needs manual verification")
-    elif days_until_deadline < 0:
-        score -= 50
-        reasons.append(f"Expired deadline: {days_until_deadline} days")
-        risk_flags.append("Expired")
-    elif days_until_deadline <= 3:
-        score -= 15
-        reasons.append(f"Very short deadline: {days_until_deadline} days")
-        risk_flags.append("Short-fuse deadline")
-    elif days_until_deadline <= 10:
-        score += 3
-        reasons.append(f"Near-term deadline: {days_until_deadline} days")
-    else:
-        score += 8
-        reasons.append(f"Workable deadline: {days_until_deadline} days")
-
-    # --------------------------------------------------------
-    # Eligibility gate
-    # --------------------------------------------------------
-    # This suppresses construction-only, commodity, or non-A/E rows from
-    # the Top 20 and action tabs. They remain visible in All_Ranked.
-
-    eligible_for_action = True
-
-    if naics not in TARGET_NAICS and naics not in SECONDARY_NAICS:
-        eligible_for_action = False
-        risk_flags.append("Suppressed: non-target NAICS")
-        reasons.append("Suppressed from action review because NAICS is not target or adjacent")
-
-    if naics in SECONDARY_NAICS and not ae_hits:
-        eligible_for_action = False
-        risk_flags.append("Suppressed: adjacent NAICS without strong A/E language")
-        reasons.append("Suppressed because adjacent NAICS lacks strong A/E language")
-
-    if bad_hits:
-        eligible_for_action = False
-        risk_flags.append("Suppressed: goods/supplies/equipment")
-        reasons.append("Suppressed because goods/supplies/equipment terms were detected")
-
-    if construction_hits and not ae_hits:
-        eligible_for_action = False
-        risk_flags.append("Suppressed: construction-only without design language")
-        reasons.append("Suppressed because construction-only terms appear without strong design/A-E language")
-
-    if not eligible_for_action:
-        score = min(score, 34)
-
-    # --------------------------------------------------------
-    # Final classification
-    # --------------------------------------------------------
-
-    score = max(0, min(100, int(score)))
-
-    drop_reason = assign_drop_reason(
-        naics=naics,
-        bad_hits=bad_hits,
-        construction_hits=construction_hits,
-        ae_hits=ae_hits,
-        eligible_for_action=eligible_for_action,
-    )
-
-    risk_flags_text = " | ".join(sorted(set(risk_flags)))
-
-    action_today = assign_action_today(
-        score=score,
-        customer_market=customer_market,
-        pursuit_type=pursuit_type,
-        days_until_deadline=days_until_deadline,
-        risk_flags=risk_flags_text,
-    )
-
-    review_priority = assign_review_priority(score, action_today)
-
-    row["review_priority"] = review_priority
-    row["action_today"] = action_today
-    row["eligible_for_action"] = eligible_for_action
-    row["customer_market"] = customer_market
-    row["drop_reason"] = drop_reason
-    row["clean_naics"] = naics
-    row["days_until_deadline"] = days_until_deadline
-    row["pursuit_type"] = pursuit_type
-    row["go_no_go_score"] = score
-    row["recommendation"] = classify_recommendation(score)
-    row["score_rationale"] = " | ".join(reasons)
-    row["risk_flags"] = risk_flags_text
-
-    return row
+    return remaining
 
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
+def mark_search_complete(search_name: str) -> None:
+    state = load_state()
+    completed = set(state.get("completed_searches", []))
+    completed.add(search_name)
+    state["completed_searches"] = sorted(completed)
+    state["last_updated"] = now_iso()
+    save_state(state)
 
-def main() -> None:
-    if not INPUT_CSV.exists():
-        raise FileNotFoundError(f"Input file not found: {INPUT_CSV}")
 
-    df = pd.read_csv(INPUT_CSV, dtype=str)
-
-    if df.empty:
-        print("Input CSV is empty. Nothing to score.")
-        return
-
-    scored = df.apply(score_row, axis=1)
-
-    scored["go_no_go_score"] = pd.to_numeric(scored["go_no_go_score"], errors="coerce").fillna(0)
-    scored["days_until_deadline_sort"] = pd.to_numeric(
-        scored["days_until_deadline"], errors="coerce"
-    ).fillna(9999)
-
-    priority_order = {
-        "1 - Review Today": 1,
-        "2 - Validate Owner": 2,
-        "3 - Monitor": 3,
-        "4 - Low Priority": 4,
-        "5 - Drop": 5,
+def build_params(search: dict[str, str], api_key: str, days_back: int, limit: int, offset: int) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "api_key": api_key,
+        "postedFrom": days_back_mmddyyyy(days_back),
+        "postedTo": today_mmddyyyy(),
+        "limit": str(limit),
+        "offset": str(offset),
     }
 
-    scored["review_priority_sort"] = scored["review_priority"].map(priority_order).fillna(99)
+    for key in ["ptype", "title", "organizationName", "ncode", "ccode", "state", "typeOfSetAside"]:
+        if search.get(key):
+            params[key] = search[key]
 
-    scored = scored.sort_values(
-        by=["review_priority_sort", "go_no_go_score", "days_until_deadline_sort", "posted_date"],
-        ascending=[True, False, True, False],
-    )
+    return params
 
-    # Reorder useful columns to the front.
-    front_cols = [
-        "review_priority",
-        "action_today",
-        "eligible_for_action",
-        "customer_market",
-        "go_no_go_score",
-        "recommendation",
-        "pursuit_type",
-        "drop_reason",
-        "risk_flags",
-        "title",
-        "department",
-        "sub_tier",
-        "office",
-        "full_parent_path_name",
-        "posted_date",
-        "response_deadline",
-        "days_until_deadline",
-        "clean_naics",
-        "naics_code",
-        "classification_code",
-        "notice_type",
-        "base_type",
-        "search_name",
-        "search_keyword",
-        "search_naics",
-        "search_ptype",
-        "query_hits",
-        "ui_link",
-        "score_rationale",
-        "description",
-    ]
 
-    existing_front = [c for c in front_cols if c in scored.columns]
-    remaining_cols = [c for c in scored.columns if c not in existing_front]
-    scored = scored[existing_front + remaining_cols]
+def fetch_one_page(search: dict[str, str], api_key: str, days_back: int, limit: int, offset: int, use_cache: bool) -> tuple[dict[str, Any], bool]:
+    params = build_params(search, api_key, days_back, limit, offset)
+    ck = cache_key(params)
+    cache_file = CACHE_DIR / f"sam_{ck}.json"
 
-    scored.to_csv(OUTPUT_CSV, index=False)
+    if use_cache and cache_file.exists():
+        return json.loads(cache_file.read_text(encoding="utf-8")), True
 
-    # Top 20 should be actionable only.
-    top20 = scored[
-        scored["review_priority"].isin(
-            ["1 - Review Today", "2 - Validate Owner", "3 - Monitor"]
-        )
-        & (scored["eligible_for_action"] == True)
-    ].head(20)
+    safe_params = {k: v for k, v in params.items() if k != "api_key"}
+    print(f"SAM request: {safe_params}")
 
-    top20.to_csv(TOP_20_CSV, index=False)
+    response = requests.get(BASE_URL, params=params, timeout=60)
 
-    review_today = scored[
-        (scored["review_priority"] == "1 - Review Today")
-        & (scored["eligible_for_action"] == True)
-    ]
+    if response.status_code in {429, 500, 502, 503, 504}:
+        raise RuntimeError(f"SAM.gov throttle/server issue: HTTP {response.status_code}: {response.text[:500]}")
 
-    validate_owner = scored[
-        (scored["review_priority"] == "2 - Validate Owner")
-        & (scored["eligible_for_action"] == True)
-    ]
+    if response.status_code == 404:
+        data = {"totalRecords": 0, "opportunitiesData": []}
+        cache_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return data, False
 
-    monitor = scored[
-        (scored["review_priority"] == "3 - Monitor")
-        & (scored["go_no_go_score"] >= 50)
-        & (scored["eligible_for_action"] == True)
-    ]
+    response.raise_for_status()
+    data = response.json()
+    cache_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return data, False
 
-    no_go = scored[
-        scored["review_priority"].isin(["4 - Low Priority", "5 - Drop"])
-        | scored["risk_flags"].str.contains("Suppressed", case=False, na=False)
-        | (scored["eligible_for_action"] != True)
-    ]
 
-    doe_nnsa = scored[
-        (scored["customer_market"] == "DOE / NNSA")
-        & (scored["eligible_for_action"] == True)
-    ]
+def record_list(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    records = payload.get("opportunitiesData")
+    if isinstance(records, list):
+        return records
+    data = payload.get("data")
+    if isinstance(data, list):
+        return data
+    return []
 
-    usace_gsa = scored[
-        scored["customer_market"].isin(
-            ["USACE / Federal Infrastructure", "GSA / Federal Buildings", "Federal Buildings / Capitol"]
-        )
-        & (scored["eligible_for_action"] == True)
-    ]
 
-    with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
-        review_today.to_excel(writer, sheet_name="1_Review_Today", index=False)
-        validate_owner.to_excel(writer, sheet_name="2_Validate_Owner", index=False)
-        monitor.to_excel(writer, sheet_name="3_Monitor", index=False)
-        no_go.to_excel(writer, sheet_name="4_No_Go", index=False)
-        doe_nnsa.to_excel(writer, sheet_name="DOE_NNSA", index=False)
-        usace_gsa.to_excel(writer, sheet_name="USACE_GSA", index=False)
-        scored.to_excel(writer, sheet_name="All_Ranked", index=False)
+def normalize_record(record: dict[str, Any], search: dict[str, str]) -> dict[str, Any]:
+    notice_id = record.get("noticeId") or record.get("noticeid") or record.get("notice_id") or ""
 
-    print("\n=== Scoring Complete ===")
-    print(f"Input records: {len(df)}")
-    print(f"Scored records: {len(scored)}")
-    print(f"Review Today: {len(review_today)}")
-    print(f"Validate Owner: {len(validate_owner)}")
-    print(f"Monitor: {len(monitor)}")
-    print(f"No-Go / Suppressed / Low Priority: {len(no_go)}")
-    print(f"DOE / NNSA actionable: {len(doe_nnsa)}")
-    print(f"USACE / GSA / Federal Buildings actionable: {len(usace_gsa)}")
-    print(f"Top 20 actionable saved to: {TOP_20_CSV.resolve()}")
-    print(f"CSV saved to: {OUTPUT_CSV.resolve()}")
-    print(f"Excel saved to: {OUTPUT_XLSX.resolve()}")
+    poc = record.get("pointOfContact") or record.get("pointofContact") or ""
+    pop = record.get("placeOfPerformance") or ""
+    office_address = record.get("officeAddress") or ""
+    resource_links = record.get("resourceLinks") or ""
+
+    return {
+        "notice_id": clean_nan(notice_id),
+        "title": clean_nan(record.get("title")),
+        "solicitation_number": clean_nan(record.get("solicitationNumber")),
+        "posted_date": clean_nan(record.get("postedDate")),
+        "response_deadline": clean_nan(record.get("responseDeadLine") or record.get("reponseDeadLine")),
+        "active": clean_nan(record.get("active")),
+        "notice_type": clean_nan(record.get("type")),
+        "base_type": clean_nan(record.get("baseType")),
+        "archive_type": clean_nan(record.get("archiveType")),
+        "archive_date": clean_nan(record.get("archiveDate")),
+        "set_aside": clean_nan(record.get("typeOfSetAsideDescription") or record.get("setAside")),
+        "set_aside_code": clean_nan(record.get("typeOfSetAside") or record.get("setAsideCode")),
+        "naics_code": clean_nan(record.get("naicsCode")),
+        "classification_code": clean_nan(record.get("classificationCode")),
+        "department": clean_nan(record.get("department")),
+        "sub_tier": clean_nan(record.get("subtier")),
+        "office": clean_nan(record.get("office")),
+        "full_parent_path_name": clean_nan(record.get("fullParentPathName")),
+        "organization_type": clean_nan(record.get("organizationType")),
+        "description": clean_nan(record.get("description")),
+        "ui_link": clean_nan(record.get("uiLink")),
+        "resource_links": json.dumps(resource_links) if isinstance(resource_links, (list, dict)) else clean_nan(resource_links),
+        "point_of_contact": json.dumps(poc) if isinstance(poc, (list, dict)) else clean_nan(poc),
+        "place_of_performance": json.dumps(pop) if isinstance(pop, (list, dict)) else clean_nan(pop),
+        "office_address": json.dumps(office_address) if isinstance(office_address, (list, dict)) else clean_nan(office_address),
+        "search_name": search.get("name", ""),
+        "search_title": search.get("title", ""),
+        "search_organization": search.get("organizationName", ""),
+        "search_naics": search.get("ncode", ""),
+        "search_ptype": search.get("ptype", ""),
+        "first_seen": now_iso(),
+        "last_seen": now_iso(),
+        "query_hits": search.get("name", ""),
+    }
+
+
+def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for col in COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[COLUMNS]
+
+
+def load_master() -> pd.DataFrame:
+    if MASTER_CSV.exists():
+        try:
+            return ensure_columns(pd.read_csv(MASTER_CSV, dtype=str).fillna(""))
+        except Exception:
+            return pd.DataFrame(columns=COLUMNS)
+    return pd.DataFrame(columns=COLUMNS)
+
+
+def is_active_value(value: Any) -> bool:
+    text = safe_str(value).strip().lower()
+    return text in {"yes", "true", "active", "1", ""}
+
+
+def merge_master(master: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
+    master = ensure_columns(master.copy()).fillna("")
+    new_df = ensure_columns(new_df.copy()).fillna("")
+
+    if new_df.empty:
+        return master
+
+    combined = pd.concat([master, new_df], ignore_index=True)
+    combined["notice_id"] = combined["notice_id"].astype(str).str.strip()
+    combined = combined[combined["notice_id"] != ""]
+
+    combined["_is_new"] = combined.index >= len(master)
+    combined = combined.sort_values(["notice_id", "_is_new"], ascending=[True, True])
+
+    merged_rows: list[dict[str, Any]] = []
+    for notice_id, group in combined.groupby("notice_id", dropna=False):
+        rows = group.to_dict("records")
+        base = rows[-1].copy()
+        first_seen_values = [r.get("first_seen", "") for r in rows if r.get("first_seen")]
+        base["first_seen"] = min(first_seen_values) if first_seen_values else now_iso()
+        base["last_seen"] = now_iso()
+
+        hits = []
+        for r in rows:
+            for field in ["query_hits", "search_name"]:
+                value = clean_nan(r.get(field, ""))
+                if value and value not in hits:
+                    hits.append(value)
+        base["query_hits"] = " | ".join(hits)
+        merged_rows.append(base)
+
+    merged = pd.DataFrame(merged_rows)
+    merged = ensure_columns(merged).fillna("")
+    merged = merged[merged["active"].apply(is_active_value)]
+    return merged.sort_values(["posted_date", "title"], ascending=[False, True])
+
+
+def write_csv_checked(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+    print(f"Saved CSV: {path.resolve()} | rows={len(df)} | bytes={path.stat().st_size}")
+
+
+def append_run_log(row: dict[str, Any]) -> None:
+    log_df = pd.DataFrame([row])
+    if RUN_LOG_CSV.exists():
+        old = pd.read_csv(RUN_LOG_CSV, dtype=str)
+        log_df = pd.concat([old, log_df], ignore_index=True)
+    write_csv_checked(log_df, RUN_LOG_CSV)
+
+
+def build_single_search(args: argparse.Namespace) -> dict[str, str]:
+    search = {"name": "Manual Search"}
+    if args.query:
+        # Use title for literal opportunity title search. Also supports organizationName through --organization.
+        search["title"] = args.query
+        search["name"] = f"Manual: {args.query}"
+    if args.organization:
+        search["organizationName"] = args.organization
+        search["name"] = f"Manual Org: {args.organization}"
+    if args.naics:
+        search["ncode"] = args.naics
+    if args.ptype:
+        search["ptype"] = args.ptype
+    return search
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Fetch SAM.gov A/E opportunities and maintain active master CSV.")
+    parser.add_argument("--max-calls", type=int, default=1)
+    parser.add_argument("--days-back", type=int, default=45)
+    parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument("--offset", type=int, default=0)
+    parser.add_argument("--reset-stack", action="store_true")
+    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--query", default="", help="Manual title search term.")
+    parser.add_argument("--organization", default="", help="Manual organizationName search term.")
+    parser.add_argument("--naics", default="", help="Manual NAICS filter. Sent to SAM.gov as ncode.")
+    parser.add_argument("--ptype", default="", help="Manual ptype filter, e.g. r, o, p, k.")
+    args = parser.parse_args()
+
+    api_key = os.getenv("SAM_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("SAM_API_KEY is not configured.")
+
+    use_cache = not args.no_cache
+    calls_made = 0
+    records_returned = 0
+    all_records: list[dict[str, Any]] = []
+    searches_run: list[str] = []
+    quota_or_throttle = False
+
+    searches = [build_single_search(args)] if (args.query or args.organization or args.naics or args.ptype) else get_next_searches(args.reset_stack)
+
+    for search in searches:
+        if calls_made >= args.max_calls:
+            break
+
+        try:
+            payload, cache_hit = fetch_one_page(
+                search=search,
+                api_key=api_key,
+                days_back=args.days_back,
+                limit=args.limit,
+                offset=args.offset,
+                use_cache=use_cache,
+            )
+            if not cache_hit:
+                calls_made += 1
+                time.sleep(1)
+
+            records = record_list(payload)
+            records_returned += len(records)
+            searches_run.append(search.get("name", ""))
+            all_records.extend([normalize_record(r, search) for r in records])
+
+            if not (args.query or args.organization or args.naics or args.ptype):
+                mark_search_complete(search["name"])
+
+            RAW_JSON.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        except RuntimeError as exc:
+            quota_or_throttle = True
+            print(f"Stopped on SAM.gov quota/throttle/server issue: {exc}")
+            break
+
+    new_df = ensure_columns(pd.DataFrame(all_records)) if all_records else pd.DataFrame(columns=COLUMNS)
+    new_df = new_df.drop_duplicates(subset=["notice_id"], keep="last") if not new_df.empty else new_df
+
+    master_before = load_master()
+    before_ids = set(master_before["notice_id"].dropna().astype(str)) if not master_before.empty else set()
+    master_after = merge_master(master_before, new_df)
+    after_new = master_after[~master_after["notice_id"].astype(str).isin(before_ids)].copy() if not master_after.empty else pd.DataFrame(columns=COLUMNS)
+
+    write_csv_checked(new_df, DEBUG_CSV)
+    write_csv_checked(master_after, MASTER_CSV)
+    write_csv_checked(after_new, NEW_TODAY_CSV)
+
+    append_run_log({
+        "run_at": now_iso(),
+        "calls_made": calls_made,
+        "records_returned_this_run": records_returned,
+        "new_unique_active_this_run": len(after_new),
+        "master_active_unique_records": len(master_after),
+        "quota_or_throttle": quota_or_throttle,
+        "searches": " | ".join(searches_run),
+    })
+
+    print("\n=== Fetch Complete ===")
+    print(f"Calls made: {calls_made}")
+    print(f"Records returned: {records_returned}")
+    print(f"Master active unique records: {len(master_after)}")
+    print(f"New unique active this run: {len(after_new)}")
+    print(f"Quota/throttle stop: {quota_or_throttle}")
 
 
 if __name__ == "__main__":
