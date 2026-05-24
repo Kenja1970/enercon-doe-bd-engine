@@ -190,7 +190,7 @@ def main() -> None:
         "python",
         "src/fetch_sam.py",
         "--max-calls",
-        "5",
+        "1",
         "--days-back",
         "45",
         "--limit",

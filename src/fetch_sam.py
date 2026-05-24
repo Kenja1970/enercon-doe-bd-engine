@@ -1,11 +1,9 @@
-from __future__ import annotations
-
 import argparse
-import hashlib
 import json
 import os
+import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,414 +11,653 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+
 load_dotenv()
 
 BASE_URL = "https://api.sam.gov/opportunities/v2/search"
 
 RAW_DIR = Path("data/raw")
-CACHE_DIR = Path("data/cache")
 STATE_DIR = Path("data/state")
-REPORTS_DIR = Path("reports")
 
 MASTER_CSV = RAW_DIR / "sam_active_master.csv"
-NEW_TODAY_CSV = RAW_DIR / "sam_new_unique_today.csv"
+TODAY_CSV = RAW_DIR / "sam_new_unique_today.csv"
 DEBUG_CSV = RAW_DIR / "sam_debug_this_run.csv"
-RAW_JSON = RAW_DIR / "sam_raw_latest.json"
 RUN_LOG_CSV = RAW_DIR / "sam_run_log.csv"
-STATE_JSON = STATE_DIR / "sam_query_state.json"
+STATE_JSON = STATE_DIR / "sam_fetch_state.json"
 
-for directory in [RAW_DIR, CACHE_DIR, STATE_DIR, REPORTS_DIR]:
-    directory.mkdir(parents=True, exist_ok=True)
-
-# SAM.gov official params used here:
-# - postedFrom / postedTo are mandatory with date format MM/dd/yyyy
-# - ptype is procurement type: r = Sources Sought, o = Solicitation, p = Presolicitation, k = Combined Synopsis/Solicitation
-# - ncode is NAICS code, not naicsCode
-# - title is title search
-# - organizationName filters by department/subtier/office name and supports general search
-SEARCH_PLAN = [
-    {"name": "DOE Engineering Sources Sought", "organizationName": "Department of Energy", "ncode": "541330", "ptype": "r"},
-    {"name": "DOE Engineering Solicitations", "organizationName": "Department of Energy", "ncode": "541330", "ptype": "o"},
-    {"name": "DOE A-E Sources Sought", "title": "architect engineer", "ncode": "541330", "ptype": "r"},
-    {"name": "DOE A-E Solicitations", "title": "architect engineer", "ncode": "541330", "ptype": "o"},
-    {"name": "NNSA Engineering Sources Sought", "organizationName": "National Nuclear Security Administration", "ncode": "541330", "ptype": "r"},
-    {"name": "NNSA Engineering Solicitations", "organizationName": "National Nuclear Security Administration", "ncode": "541330", "ptype": "o"},
-    {"name": "DOE Architectural Sources Sought", "organizationName": "Department of Energy", "ncode": "541310", "ptype": "r"},
-    {"name": "DOE Architectural Solicitations", "organizationName": "Department of Energy", "ncode": "541310", "ptype": "o"},
-    {"name": "DOE Environmental Consulting Sources Sought", "organizationName": "Department of Energy", "ncode": "541620", "ptype": "r"},
-    {"name": "DOE Environmental Consulting Solicitations", "organizationName": "Department of Energy", "ncode": "541620", "ptype": "o"},
-    {"name": "DOE Technical Consulting Sources Sought", "organizationName": "Department of Energy", "ncode": "541690", "ptype": "r"},
-    {"name": "DOE Technical Consulting Solicitations", "organizationName": "Department of Energy", "ncode": "541690", "ptype": "o"},
-    {"name": "Oak Ridge Engineering", "organizationName": "Oak Ridge", "ncode": "541330", "ptype": "r"},
-    {"name": "Y-12 Engineering", "organizationName": "Y-12", "ncode": "541330", "ptype": "r"},
-    {"name": "Savannah River Engineering", "organizationName": "Savannah River", "ncode": "541330", "ptype": "r"},
-    {"name": "Hanford Engineering", "organizationName": "Hanford", "ncode": "541330", "ptype": "r"},
-    {"name": "INL Engineering", "organizationName": "Idaho National Laboratory", "ncode": "541330", "ptype": "r"},
-    {"name": "Los Alamos Engineering", "organizationName": "Los Alamos", "ncode": "541330", "ptype": "r"},
-    {"name": "Sandia Engineering", "organizationName": "Sandia", "ncode": "541330", "ptype": "r"},
-    {"name": "Pantex Engineering", "organizationName": "Pantex", "ncode": "541330", "ptype": "r"},
-    {"name": "Fire Protection Engineering", "title": "fire protection engineering", "ncode": "541330", "ptype": "r"},
-    {"name": "Facility Modernization Engineering", "title": "facility modernization engineering", "ncode": "541330", "ptype": "r"},
-    {"name": "Mechanical Engineering", "title": "mechanical engineering", "ncode": "541330", "ptype": "r"},
-    {"name": "Electrical Engineering", "title": "electrical engineering", "ncode": "541330", "ptype": "r"},
-    {"name": "Civil Structural Engineering", "title": "civil structural engineering", "ncode": "541330", "ptype": "r"},
-]
+DEFAULT_LIMIT = 50
 
 COLUMNS = [
-    "notice_id", "title", "solicitation_number", "posted_date", "response_deadline",
-    "active", "notice_type", "base_type", "archive_type", "archive_date", "set_aside",
-    "set_aside_code", "naics_code", "classification_code", "department", "sub_tier",
-    "office", "full_parent_path_name", "organization_type", "description", "ui_link",
-    "resource_links", "point_of_contact", "place_of_performance", "office_address",
-    "search_name", "search_title", "search_organization", "search_naics", "search_ptype",
-    "first_seen", "last_seen", "query_hits",
+    "dedupe_key",
+    "notice_id",
+    "solicitation_number",
+    "title",
+    "department",
+    "sub_tier",
+    "office",
+    "posted_date",
+    "response_deadline",
+    "naics_code",
+    "ptype",
+    "notice_type",
+    "ui_link",
+    "description",
+    "search_name",
+    "search_index",
+    "offset_used",
+    "fetched_at_utc",
 ]
 
 
-def now_iso() -> str:
-    return datetime.now().replace(microsecond=0).isoformat()
+# The order matters, but state rotation prevents the first few from being hit every day.
+# Keep high-value A/E searches near the top, then rotate through broader DOE/NNSA/site searches.
+SEARCH_PLAN: list[dict[str, Any]] = [
+    {
+        "name": "DOE Engineering Services - Sources Sought",
+        "params": {
+            "ptype": "r",
+            "organizationName": "Department of Energy",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "DOE Engineering Services - Solicitation",
+        "params": {
+            "ptype": "o",
+            "organizationName": "Department of Energy",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "A/E Title Search - Sources Sought",
+        "params": {
+            "ptype": "r",
+            "title": "architect engineer",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "A/E Title Search - Solicitation",
+        "params": {
+            "ptype": "o",
+            "title": "architect engineer",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "NNSA Engineering Services - Sources Sought",
+        "params": {
+            "ptype": "r",
+            "organizationName": "National Nuclear Security Administration",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "NNSA Engineering Services - Solicitation",
+        "params": {
+            "ptype": "o",
+            "organizationName": "National Nuclear Security Administration",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "DOE Architectural Services - Sources Sought",
+        "params": {
+            "ptype": "r",
+            "organizationName": "Department of Energy",
+            "ncode": "541310",
+        },
+    },
+    {
+        "name": "DOE Architectural Services - Solicitation",
+        "params": {
+            "ptype": "o",
+            "organizationName": "Department of Energy",
+            "ncode": "541310",
+        },
+    },
+    {
+        "name": "DOE Environmental Consulting - Sources Sought",
+        "params": {
+            "ptype": "r",
+            "organizationName": "Department of Energy",
+            "ncode": "541620",
+        },
+    },
+    {
+        "name": "DOE Environmental Consulting - Solicitation",
+        "params": {
+            "ptype": "o",
+            "organizationName": "Department of Energy",
+            "ncode": "541620",
+        },
+    },
+    {
+        "name": "DOE Technical Consulting - Sources Sought",
+        "params": {
+            "ptype": "r",
+            "organizationName": "Department of Energy",
+            "ncode": "541690",
+        },
+    },
+    {
+        "name": "DOE Technical Consulting - Solicitation",
+        "params": {
+            "ptype": "o",
+            "organizationName": "Department of Energy",
+            "ncode": "541690",
+        },
+    },
+    {
+        "name": "Oak Ridge Engineering Services",
+        "params": {
+            "ptype": "r",
+            "title": "Oak Ridge engineering services",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "Y-12 Engineering Services",
+        "params": {
+            "ptype": "r",
+            "title": "Y-12 engineering services",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "Savannah River Engineering Services",
+        "params": {
+            "ptype": "r",
+            "title": "Savannah River engineering services",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "Hanford Engineering Services",
+        "params": {
+            "ptype": "r",
+            "title": "Hanford engineering services",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "Idaho National Laboratory Engineering Services",
+        "params": {
+            "ptype": "r",
+            "title": "Idaho National Laboratory engineering services",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "Los Alamos Engineering Services",
+        "params": {
+            "ptype": "r",
+            "title": "Los Alamos engineering services",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "Sandia Engineering Services",
+        "params": {
+            "ptype": "r",
+            "title": "Sandia engineering services",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "Pantex Engineering Services",
+        "params": {
+            "ptype": "r",
+            "title": "Pantex engineering services",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "DOE Fire Protection Engineering",
+        "params": {
+            "ptype": "r",
+            "title": "fire protection engineering",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "DOE Facility Modernization Engineering",
+        "params": {
+            "ptype": "r",
+            "title": "facility modernization engineering",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "DOE Mechanical Engineering",
+        "params": {
+            "ptype": "r",
+            "title": "mechanical engineering",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "DOE Electrical Engineering",
+        "params": {
+            "ptype": "r",
+            "title": "electrical engineering",
+            "ncode": "541330",
+        },
+    },
+    {
+        "name": "DOE Civil Structural Engineering",
+        "params": {
+            "ptype": "r",
+            "title": "civil structural engineering",
+            "ncode": "541330",
+        },
+    },
+]
 
 
-def today_mmddyyyy() -> str:
-    return datetime.now().strftime("%m/%d/%Y")
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def days_back_mmddyyyy(days_back: int) -> str:
-    return (datetime.now() - timedelta(days=days_back)).strftime("%m/%d/%Y")
+def ensure_dirs() -> None:
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def safe_str(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, float) and pd.isna(value):
-        return ""
-    return str(value)
-
-
-def clean_nan(value: Any) -> str:
-    text = safe_str(value)
-    return "" if text.lower() == "nan" else text
-
-
-def cache_key(params: dict[str, Any]) -> str:
-    safe_params = {k: v for k, v in params.items() if k != "api_key"}
-    raw = json.dumps(safe_params, sort_keys=True)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+def date_range(days_back: int) -> tuple[str, str]:
+    today = datetime.now()
+    start = today - timedelta(days=days_back)
+    return start.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y")
 
 
 def load_state() -> dict[str, Any]:
     if STATE_JSON.exists():
         try:
-            return json.loads(STATE_JSON.read_text(encoding="utf-8"))
+            with STATE_JSON.open("r", encoding="utf-8") as f:
+                state = json.load(f)
         except Exception:
-            return {"completed_searches": []}
-    return {"completed_searches": []}
+            state = {}
+    else:
+        state = {}
+
+    state.setdefault("next_query_index", 0)
+    state.setdefault("query_offsets", {})
+    state.setdefault("query_stats", {})
+    state.setdefault("last_run_utc", None)
+    state.setdefault("total_runs", 0)
+
+    # Defensive cleanup if search plan changed.
+    if not isinstance(state["next_query_index"], int):
+        state["next_query_index"] = 0
+
+    if state["next_query_index"] >= len(SEARCH_PLAN):
+        state["next_query_index"] = 0
+
+    return state
 
 
 def save_state(state: dict[str, Any]) -> None:
     STATE_JSON.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
-def get_next_searches(reset_stack: bool = False) -> list[dict[str, str]]:
-    if reset_stack:
-        state = {"completed_searches": []}
-        save_state(state)
-    else:
-        state = load_state()
-
-    completed = set(state.get("completed_searches", []))
-    remaining = [s for s in SEARCH_PLAN if s["name"] not in completed]
-
-    if not remaining:
-        state = {"completed_searches": []}
-        save_state(state)
-        return SEARCH_PLAN.copy()
-
-    return remaining
+def safe_get(record: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = record.get(key)
+        if value is not None and value != "":
+            return str(value)
+    return ""
 
 
-def mark_search_complete(search_name: str) -> None:
-    state = load_state()
-    completed = set(state.get("completed_searches", []))
-    completed.add(search_name)
-    state["completed_searches"] = sorted(completed)
-    state["last_updated"] = now_iso()
-    save_state(state)
-
-
-def build_params(search: dict[str, str], api_key: str, days_back: int, limit: int, offset: int) -> dict[str, Any]:
-    params: dict[str, Any] = {
-        "api_key": api_key,
-        "postedFrom": days_back_mmddyyyy(days_back),
-        "postedTo": today_mmddyyyy(),
-        "limit": str(limit),
-        "offset": str(offset),
-    }
-
-    for key in ["ptype", "title", "organizationName", "ncode", "ccode", "state", "typeOfSetAside"]:
-        if search.get(key):
-            params[key] = search[key]
-
-    return params
-
-
-def fetch_one_page(search: dict[str, str], api_key: str, days_back: int, limit: int, offset: int, use_cache: bool) -> tuple[dict[str, Any], bool]:
-    params = build_params(search, api_key, days_back, limit, offset)
-    ck = cache_key(params)
-    cache_file = CACHE_DIR / f"sam_{ck}.json"
-
-    if use_cache and cache_file.exists():
-        return json.loads(cache_file.read_text(encoding="utf-8")), True
-
-    safe_params = {k: v for k, v in params.items() if k != "api_key"}
-    print(f"SAM request: {safe_params}")
-
-    response = requests.get(BASE_URL, params=params, timeout=60)
-
-    if response.status_code in {429, 500, 502, 503, 504}:
-        raise RuntimeError(f"SAM.gov throttle/server issue: HTTP {response.status_code}: {response.text[:500]}")
-
-    if response.status_code == 404:
-        data = {"totalRecords": 0, "opportunitiesData": []}
-        cache_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        return data, False
-
-    response.raise_for_status()
-    data = response.json()
-    cache_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return data, False
-
-
-def record_list(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    records = payload.get("opportunitiesData")
-    if isinstance(records, list):
-        return records
-    data = payload.get("data")
-    if isinstance(data, list):
-        return data
+def extract_opportunities(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    # SAM.gov commonly returns opportunitiesData, but keep this defensive.
+    for key in ["opportunitiesData", "data", "records", "opportunities"]:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
     return []
 
 
-def normalize_record(record: dict[str, Any], search: dict[str, str]) -> dict[str, Any]:
-    notice_id = record.get("noticeId") or record.get("noticeid") or record.get("notice_id") or ""
+def make_dedupe_key(row: dict[str, str]) -> str:
+    if row.get("notice_id"):
+        return f"notice:{row['notice_id']}".lower()
 
-    poc = record.get("pointOfContact") or record.get("pointofContact") or ""
-    pop = record.get("placeOfPerformance") or ""
-    office_address = record.get("officeAddress") or ""
-    resource_links = record.get("resourceLinks") or ""
+    if row.get("solicitation_number"):
+        return f"sol:{row['solicitation_number']}".lower()
 
-    return {
-        "notice_id": clean_nan(notice_id),
-        "title": clean_nan(record.get("title")),
-        "solicitation_number": clean_nan(record.get("solicitationNumber")),
-        "posted_date": clean_nan(record.get("postedDate")),
-        "response_deadline": clean_nan(record.get("responseDeadLine") or record.get("reponseDeadLine")),
-        "active": clean_nan(record.get("active")),
-        "notice_type": clean_nan(record.get("type")),
-        "base_type": clean_nan(record.get("baseType")),
-        "archive_type": clean_nan(record.get("archiveType")),
-        "archive_date": clean_nan(record.get("archiveDate")),
-        "set_aside": clean_nan(record.get("typeOfSetAsideDescription") or record.get("setAside")),
-        "set_aside_code": clean_nan(record.get("typeOfSetAside") or record.get("setAsideCode")),
-        "naics_code": clean_nan(record.get("naicsCode")),
-        "classification_code": clean_nan(record.get("classificationCode")),
-        "department": clean_nan(record.get("department")),
-        "sub_tier": clean_nan(record.get("subtier")),
-        "office": clean_nan(record.get("office")),
-        "full_parent_path_name": clean_nan(record.get("fullParentPathName")),
-        "organization_type": clean_nan(record.get("organizationType")),
-        "description": clean_nan(record.get("description")),
-        "ui_link": clean_nan(record.get("uiLink")),
-        "resource_links": json.dumps(resource_links) if isinstance(resource_links, (list, dict)) else clean_nan(resource_links),
-        "point_of_contact": json.dumps(poc) if isinstance(poc, (list, dict)) else clean_nan(poc),
-        "place_of_performance": json.dumps(pop) if isinstance(pop, (list, dict)) else clean_nan(pop),
-        "office_address": json.dumps(office_address) if isinstance(office_address, (list, dict)) else clean_nan(office_address),
-        "search_name": search.get("name", ""),
-        "search_title": search.get("title", ""),
-        "search_organization": search.get("organizationName", ""),
-        "search_naics": search.get("ncode", ""),
-        "search_ptype": search.get("ptype", ""),
-        "first_seen": now_iso(),
-        "last_seen": now_iso(),
-        "query_hits": search.get("name", ""),
+    title = row.get("title", "").strip().lower()
+    deadline = row.get("response_deadline", "").strip().lower()
+    office = row.get("office", "").strip().lower()
+    return f"title:{title}|deadline:{deadline}|office:{office}"
+
+
+def normalize_record(
+    record: dict[str, Any],
+    *,
+    search_name: str,
+    search_index: int,
+    offset_used: int,
+) -> dict[str, str]:
+    title = safe_get(record, "title")
+    notice_id = safe_get(record, "noticeId", "notice_id", "_id")
+    solicitation_number = safe_get(record, "solicitationNumber", "solicitation_number")
+    department = safe_get(record, "department", "departmentName", "fullParentPathName")
+    sub_tier = safe_get(record, "subTier", "subTierName")
+    office = safe_get(record, "office", "officeName")
+    posted_date = safe_get(record, "postedDate", "posted_date")
+    response_deadline = safe_get(record, "responseDeadLine", "responseDeadline", "response_deadline")
+    naics_code = safe_get(record, "naicsCode", "naics_code", "ncode")
+    ptype = safe_get(record, "type", "ptype")
+    notice_type = safe_get(record, "baseType", "noticeType")
+    ui_link = safe_get(record, "uiLink", "ui_link", "url")
+    description = safe_get(record, "description", "shortDescription")
+
+    row = {
+        "dedupe_key": "",
+        "notice_id": notice_id,
+        "solicitation_number": solicitation_number,
+        "title": title,
+        "department": department,
+        "sub_tier": sub_tier,
+        "office": office,
+        "posted_date": posted_date,
+        "response_deadline": response_deadline,
+        "naics_code": naics_code,
+        "ptype": ptype,
+        "notice_type": notice_type,
+        "ui_link": ui_link,
+        "description": description,
+        "search_name": search_name,
+        "search_index": str(search_index),
+        "offset_used": str(offset_used),
+        "fetched_at_utc": utc_now_iso(),
     }
 
+    row["dedupe_key"] = make_dedupe_key(row)
+    return row
 
-def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
+
+def save_csv(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if df.empty:
+        df = pd.DataFrame(columns=COLUMNS)
+
     for col in COLUMNS:
         if col not in df.columns:
             df[col] = ""
-    return df[COLUMNS]
 
-
-def load_master() -> pd.DataFrame:
-    if MASTER_CSV.exists():
-        try:
-            return ensure_columns(pd.read_csv(MASTER_CSV, dtype=str).fillna(""))
-        except Exception:
-            return pd.DataFrame(columns=COLUMNS)
-    return pd.DataFrame(columns=COLUMNS)
-
-
-def is_active_value(value: Any) -> bool:
-    text = safe_str(value).strip().lower()
-    return text in {"yes", "true", "active", "1", ""}
-
-
-def merge_master(master: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
-    master = ensure_columns(master.copy()).fillna("")
-    new_df = ensure_columns(new_df.copy()).fillna("")
-
-    if new_df.empty:
-        return master
-
-    combined = pd.concat([master, new_df], ignore_index=True)
-    combined["notice_id"] = combined["notice_id"].astype(str).str.strip()
-    combined = combined[combined["notice_id"] != ""]
-
-    combined["_is_new"] = combined.index >= len(master)
-    combined = combined.sort_values(["notice_id", "_is_new"], ascending=[True, True])
-
-    merged_rows: list[dict[str, Any]] = []
-    for notice_id, group in combined.groupby("notice_id", dropna=False):
-        rows = group.to_dict("records")
-        base = rows[-1].copy()
-        first_seen_values = [r.get("first_seen", "") for r in rows if r.get("first_seen")]
-        base["first_seen"] = min(first_seen_values) if first_seen_values else now_iso()
-        base["last_seen"] = now_iso()
-
-        hits = []
-        for r in rows:
-            for field in ["query_hits", "search_name"]:
-                value = clean_nan(r.get(field, ""))
-                if value and value not in hits:
-                    hits.append(value)
-        base["query_hits"] = " | ".join(hits)
-        merged_rows.append(base)
-
-    merged = pd.DataFrame(merged_rows)
-    merged = ensure_columns(merged).fillna("")
-    merged = merged[merged["active"].apply(is_active_value)]
-    return merged.sort_values(["posted_date", "title"], ascending=[False, True])
-
-
-def write_csv_checked(df: pd.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    df = df[COLUMNS]
     df.to_csv(path, index=False)
+
     print(f"Saved CSV: {path.resolve()} | rows={len(df)} | bytes={path.stat().st_size}")
 
 
-def append_run_log(row: dict[str, Any]) -> None:
-    log_df = pd.DataFrame([row])
+def load_master() -> pd.DataFrame:
+    if not MASTER_CSV.exists():
+        return pd.DataFrame(columns=COLUMNS)
+
+    try:
+        df = pd.read_csv(MASTER_CSV, dtype=str).fillna("")
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=COLUMNS)
+
+    for col in COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    if "dedupe_key" not in df.columns or df["dedupe_key"].eq("").all():
+        df["dedupe_key"] = df.apply(lambda r: make_dedupe_key(r.to_dict()), axis=1)
+
+    return df[COLUMNS]
+
+
+def append_run_log(entry: dict[str, Any]) -> None:
     if RUN_LOG_CSV.exists():
-        old = pd.read_csv(RUN_LOG_CSV, dtype=str)
-        log_df = pd.concat([old, log_df], ignore_index=True)
-    write_csv_checked(log_df, RUN_LOG_CSV)
+        try:
+            old = pd.read_csv(RUN_LOG_CSV, dtype=str).fillna("")
+        except Exception:
+            old = pd.DataFrame()
+    else:
+        old = pd.DataFrame()
+
+    new = pd.DataFrame([entry])
+    combined = pd.concat([old, new], ignore_index=True)
+    combined.to_csv(RUN_LOG_CSV, index=False)
+    print(f"Saved CSV: {RUN_LOG_CSV.resolve()} | rows={len(combined)} | bytes={RUN_LOG_CSV.stat().st_size}")
 
 
-def build_single_search(args: argparse.Namespace) -> dict[str, str]:
-    search = {"name": "Manual Search"}
-    if args.query:
-        # Use title for literal opportunity title search. Also supports organizationName through --organization.
-        search["title"] = args.query
-        search["name"] = f"Manual: {args.query}"
-    if args.organization:
-        search["organizationName"] = args.organization
-        search["name"] = f"Manual Org: {args.organization}"
-    if args.naics:
-        search["ncode"] = args.naics
-    if args.ptype:
-        search["ptype"] = args.ptype
-    return search
+def call_sam(api_key: str, params: dict[str, Any]) -> tuple[list[dict[str, Any]], bool, str]:
+    request_params = dict(params)
+    request_params["api_key"] = api_key
+
+    printable = {k: v for k, v in params.items()}
+    print(f"SAM request: {printable}")
+
+    try:
+        response = requests.get(BASE_URL, params=request_params, timeout=60)
+    except requests.RequestException as exc:
+        return [], True, f"SAM.gov request exception: {exc}"
+
+    if response.status_code == 429:
+        return [], True, f"SAM.gov throttle/server issue: HTTP 429: {response.text}"
+
+    if response.status_code >= 500:
+        return [], True, f"SAM.gov throttle/server issue: HTTP {response.status_code}: {response.text}"
+
+    if response.status_code != 200:
+        return [], False, f"SAM.gov request failed: HTTP {response.status_code}: {response.text}"
+
+    try:
+        payload = response.json()
+    except Exception as exc:
+        return [], False, f"SAM.gov JSON parse failure: {exc}; body={response.text[:500]}"
+
+    records = extract_opportunities(payload)
+    return records, False, ""
+
+
+def advance_query_index(current_index: int) -> int:
+    next_index = current_index + 1
+    if next_index >= len(SEARCH_PLAN):
+        next_index = 0
+    return next_index
+
+
+def fetch_statefully(
+    *,
+    api_key: str,
+    days_back: int,
+    limit: int,
+    max_calls: int,
+    sleep_seconds: float,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    posted_from, posted_to = date_range(days_back)
+    state = load_state()
+
+    all_rows: list[dict[str, str]] = []
+    calls_made = 0
+    records_returned = 0
+    quota_stop = False
+    messages: list[str] = []
+    searches_run: list[str] = []
+
+    query_index = int(state.get("next_query_index", 0))
+
+    for _ in range(max_calls):
+        plan = SEARCH_PLAN[query_index]
+        search_name = plan["name"]
+        search_key = str(query_index)
+
+        offset = int(state.get("query_offsets", {}).get(search_key, 0))
+
+        params = {
+            "postedFrom": posted_from,
+            "postedTo": posted_to,
+            "limit": str(limit),
+            "offset": str(offset),
+        }
+        params.update(plan["params"])
+
+        records, is_quota_or_server, message = call_sam(api_key, params)
+
+        if is_quota_or_server:
+            quota_stop = True
+            messages.append(message)
+            print(f"Stopped on SAM.gov quota/throttle/server issue: {message}")
+            break
+
+        if message:
+            messages.append(message)
+            print(message)
+
+        calls_made += 1
+        records_returned += len(records)
+        searches_run.append(search_name)
+
+        for record in records:
+            all_rows.append(
+                normalize_record(
+                    record,
+                    search_name=search_name,
+                    search_index=query_index,
+                    offset_used=offset,
+                )
+            )
+
+        stats = state.setdefault("query_stats", {}).setdefault(search_key, {})
+        stats["name"] = search_name
+        stats["last_checked_utc"] = utc_now_iso()
+        stats["last_offset_used"] = offset
+        stats["last_records_returned"] = len(records)
+
+        # Pagination and rotation logic:
+        # - If the query returned a full page, continue this same query next time at the next offset.
+        # - If it returned less than a full page, assume this query is exhausted for now and rotate.
+        if len(records) >= limit:
+            state["query_offsets"][search_key] = offset + limit
+            state["next_query_index"] = query_index
+        else:
+            state["query_offsets"][search_key] = 0
+            query_index = advance_query_index(query_index)
+            state["next_query_index"] = query_index
+
+        save_state(state)
+
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+    state["last_run_utc"] = utc_now_iso()
+    state["total_runs"] = int(state.get("total_runs", 0)) + 1
+    save_state(state)
+
+    debug_df = pd.DataFrame(all_rows, columns=COLUMNS)
+
+    run_summary = {
+        "run_at_utc": utc_now_iso(),
+        "calls_made": calls_made,
+        "records_returned_this_run": records_returned,
+        "new_unique_active_this_run": None,
+        "master_active_unique_records": None,
+        "quota_throttle_stop": quota_stop,
+        "next_query_index": state.get("next_query_index"),
+        "searches": " | ".join(searches_run),
+        "messages": " | ".join(messages),
+    }
+
+    return debug_df, run_summary
+
+
+def merge_with_master(debug_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    master_before = load_master()
+    before_keys = set(master_before["dedupe_key"].astype(str).tolist())
+
+    if debug_df.empty:
+        master_after = master_before.copy()
+        new_today = pd.DataFrame(columns=COLUMNS)
+        return master_after, new_today
+
+    for col in COLUMNS:
+        if col not in debug_df.columns:
+            debug_df[col] = ""
+
+    debug_df = debug_df[COLUMNS].fillna("")
+    debug_df = debug_df[debug_df["dedupe_key"].astype(str).str.len() > 0]
+
+    new_today = debug_df[~debug_df["dedupe_key"].isin(before_keys)].copy()
+
+    combined = pd.concat([master_before, debug_df], ignore_index=True).fillna("")
+    combined = combined.drop_duplicates(subset=["dedupe_key"], keep="last")
+    combined = combined[COLUMNS]
+
+    return combined, new_today[COLUMNS] if not new_today.empty else pd.DataFrame(columns=COLUMNS)
+
+
+def print_state_summary() -> None:
+    state = load_state()
+    next_index = int(state.get("next_query_index", 0))
+    next_name = SEARCH_PLAN[next_index]["name"] if SEARCH_PLAN else "None"
+
+    print("")
+    print("=== Stateful Coverage Status ===")
+    print(f"Next query index: {next_index}")
+    print(f"Next query name: {next_name}")
+    print(f"State file: {STATE_JSON.resolve()}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Fetch SAM.gov opportunities with stateful rotation and pagination.")
+    parser.add_argument("--max-calls", type=int, default=5, help="Maximum SAM.gov API calls to make this run.")
+    parser.add_argument("--days-back", type=int, default=45, help="Lookback window for postedFrom.")
+    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="SAM.gov page size.")
+    parser.add_argument("--sleep-seconds", type=float, default=1.0, help="Delay between API calls.")
+    parser.add_argument("--reset-state", action="store_true", help="Reset query rotation and offsets before running.")
+    parser.add_argument("--show-state", action="store_true", help="Show current state and exit.")
+    return parser.parse_args()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch SAM.gov A/E opportunities and maintain active master CSV.")
-    parser.add_argument("--max-calls", type=int, default=1)
-    parser.add_argument("--days-back", type=int, default=45)
-    parser.add_argument("--limit", type=int, default=50)
-    parser.add_argument("--offset", type=int, default=0)
-    parser.add_argument("--reset-stack", action="store_true")
-    parser.add_argument("--no-cache", action="store_true")
-    parser.add_argument("--query", default="", help="Manual title search term.")
-    parser.add_argument("--organization", default="", help="Manual organizationName search term.")
-    parser.add_argument("--naics", default="", help="Manual NAICS filter. Sent to SAM.gov as ncode.")
-    parser.add_argument("--ptype", default="", help="Manual ptype filter, e.g. r, o, p, k.")
-    args = parser.parse_args()
+    ensure_dirs()
+    args = parse_args()
+
+    if args.reset_state and STATE_JSON.exists():
+        STATE_JSON.unlink()
+        print(f"Deleted state file: {STATE_JSON.resolve()}")
+
+    if args.show_state:
+        print_state_summary()
+        return
 
     api_key = os.getenv("SAM_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("SAM_API_KEY is not configured.")
+        print("ERROR: SAM_API_KEY is not set. Add it to .env locally or Cloud Run secrets.", file=sys.stderr)
+        sys.exit(1)
 
-    use_cache = not args.no_cache
-    calls_made = 0
-    records_returned = 0
-    all_records: list[dict[str, Any]] = []
-    searches_run: list[str] = []
-    quota_or_throttle = False
+    debug_df, run_summary = fetch_statefully(
+        api_key=api_key,
+        days_back=args.days_back,
+        limit=args.limit,
+        max_calls=args.max_calls,
+        sleep_seconds=args.sleep_seconds,
+    )
 
-    searches = [build_single_search(args)] if (args.query or args.organization or args.naics or args.ptype) else get_next_searches(args.reset_stack)
+    master_after, new_today = merge_with_master(debug_df)
 
-    for search in searches:
-        if calls_made >= args.max_calls:
-            break
+    run_summary["new_unique_active_this_run"] = len(new_today)
+    run_summary["master_active_unique_records"] = len(master_after)
 
-        try:
-            payload, cache_hit = fetch_one_page(
-                search=search,
-                api_key=api_key,
-                days_back=args.days_back,
-                limit=args.limit,
-                offset=args.offset,
-                use_cache=use_cache,
-            )
-            if not cache_hit:
-                calls_made += 1
-                time.sleep(1)
+    save_csv(debug_df, DEBUG_CSV)
+    save_csv(master_after, MASTER_CSV)
+    save_csv(new_today, TODAY_CSV)
+    append_run_log(run_summary)
 
-            records = record_list(payload)
-            records_returned += len(records)
-            searches_run.append(search.get("name", ""))
-            all_records.extend([normalize_record(r, search) for r in records])
-
-            if not (args.query or args.organization or args.naics or args.ptype):
-                mark_search_complete(search["name"])
-
-            RAW_JSON.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-        except RuntimeError as exc:
-            quota_or_throttle = True
-            print(f"Stopped on SAM.gov quota/throttle/server issue: {exc}")
-            break
-
-    new_df = ensure_columns(pd.DataFrame(all_records)) if all_records else pd.DataFrame(columns=COLUMNS)
-    new_df = new_df.drop_duplicates(subset=["notice_id"], keep="last") if not new_df.empty else new_df
-
-    master_before = load_master()
-    before_ids = set(master_before["notice_id"].dropna().astype(str)) if not master_before.empty else set()
-    master_after = merge_master(master_before, new_df)
-    after_new = master_after[~master_after["notice_id"].astype(str).isin(before_ids)].copy() if not master_after.empty else pd.DataFrame(columns=COLUMNS)
-
-    write_csv_checked(new_df, DEBUG_CSV)
-    write_csv_checked(master_after, MASTER_CSV)
-    write_csv_checked(after_new, NEW_TODAY_CSV)
-
-    append_run_log({
-        "run_at": now_iso(),
-        "calls_made": calls_made,
-        "records_returned_this_run": records_returned,
-        "new_unique_active_this_run": len(after_new),
-        "master_active_unique_records": len(master_after),
-        "quota_or_throttle": quota_or_throttle,
-        "searches": " | ".join(searches_run),
-    })
-
-    print("\n=== Fetch Complete ===")
-    print(f"Calls made: {calls_made}")
-    print(f"Records returned: {records_returned}")
-    print(f"Master active unique records: {len(master_after)}")
-    print(f"New unique active this run: {len(after_new)}")
-    print(f"Quota/throttle stop: {quota_or_throttle}")
+    print("")
+    print("=== Fetch Complete ===")
+    print(f"Calls made: {run_summary['calls_made']}")
+    print(f"Records returned: {run_summary['records_returned_this_run']}")
+    print(f"Master active unique records: {run_summary['master_active_unique_records']}")
+    print(f"New unique active this run: {run_summary['new_unique_active_this_run']}")
+    print(f"Quota/throttle stop: {run_summary['quota_throttle_stop']}")
+    print_state_summary()
 
 
 if __name__ == "__main__":
